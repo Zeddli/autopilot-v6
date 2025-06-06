@@ -1,22 +1,15 @@
+// src/kafka/kafka.module.ts
 import { Module, forwardRef } from '@nestjs/common';
-import { ConfigModule } from '@nestjs/config';
 import { KafkaService } from './kafka.service';
 import { KafkaController } from './controllers/kafka.controller';
 import { MessageConsumer } from './consumers/message.consumer';
 import { AutopilotProducer } from './producers/autopilot.producer';
 import { AutopilotConsumer } from './consumers/autopilot.consumer';
-import configuration from '../config/configuration';
-import { validationSchema } from '../config/validation';
+import { ConfigModule } from '@nestjs/config';
 import { AutopilotModule } from '../autopilot/autopilot.module';
 
 @Module({
-  imports: [
-    ConfigModule.forRoot({
-      load: [configuration],
-      validationSchema,
-    }),
-    forwardRef(() => AutopilotModule),
-  ],
+  imports: [ConfigModule, forwardRef(() => AutopilotModule)],
   controllers: [KafkaController],
   providers: [
     KafkaService,
