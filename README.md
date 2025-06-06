@@ -55,12 +55,6 @@ SCHEMA_REGISTRY_URL=http://localhost:8081
 ### 3. Install Dependencies
 
 ```bash
-# Using npm
-npm install
-
-# Using yarn
-yarn install
-
 # Using pnpm
 pnpm install
 ```
@@ -69,7 +63,7 @@ pnpm install
 
 1. Start Kafka infrastructure using Docker Compose:
 ```bash
-docker-compose up -d
+docker compose up -d
 ```
 
 This will start:
@@ -81,10 +75,10 @@ This will start:
 2. Verify Docker containers are healthy:
 ```bash
 # Check container status
-docker-compose ps
+docker compose ps
 
 # Check container logs for any errors
-docker-compose logs
+docker compose logs
 
 # Verify Kafka UI is accessible
 http://localhost:8080
