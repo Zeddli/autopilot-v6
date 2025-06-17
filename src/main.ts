@@ -5,6 +5,7 @@ import { ValidationPipe } from '@nestjs/common';
 import { ResponseInterceptor } from './common/interceptors/response.interceptor';
 import { GlobalExceptionFilter } from './common/filters/http-exception.filter';
 import { LoggerService } from './common/services/logger.service';
+import { RecoveryService } from './recovery/services/recovery.service';
 
 async function bootstrap() {
   const logger = new LoggerService('Bootstrap');
@@ -27,6 +28,22 @@ async function bootstrap() {
 
   // Global filters
   app.useGlobalFilters(new GlobalExceptionFilter());
+
+  // Execute startup recovery before starting consumers
+  logger.info('Executing startup recovery...');
+  try {
+    const recoveryService = app.get(RecoveryService);
+    await recoveryService.executeStartupRecovery();
+    logger.info('Startup recovery completed successfully');
+  } catch (error) {
+    const err = error as Error;
+    logger.error('Startup recovery failed:', {
+      error: err.stack || err.message,
+    });
+    // Continue with startup even if recovery fails
+    // The system should be able to operate without recovery
+    logger.warn('Continuing with application startup despite recovery failure');
+  }
 
   const autopilotConsumer = app.get(AutopilotConsumer);
   await autopilotConsumer.startConsumer('autopilot-group');
