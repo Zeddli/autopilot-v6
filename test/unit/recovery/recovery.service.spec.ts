@@ -1,1 +1,5 @@
-describe("RecoveryService", () => { it("should be defined", () => { expect(true).toBe(true); }); });
+describe('RecoveryService', () => {
+  it('should be defined', () => {
+    expect(true).toBe(true);
+  });
+});
