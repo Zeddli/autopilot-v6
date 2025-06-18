@@ -1,4 +1,9 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  OnModuleInit,
+  OnModuleDestroy,
+} from '@nestjs/common';
 import { SchedulerRegistry } from '@nestjs/schedule';
 import { CronJob } from 'cron';
 import { v4 as uuidv4 } from 'uuid';
@@ -12,10 +17,58 @@ import { SchedulerErrorType, SchedulerError } from '../types/scheduler.types';
 import { AutopilotProducer } from '../../kafka/producers/autopilot.producer';
 import { PhaseTransitionPayload } from '../../kafka/templates/autopilot.template';
 
+/**
+ * Custom error class for scheduler operations
+ * Provides structured error information without exposing sensitive details
+ */
+class SchedulerOperationError extends Error {
+  public readonly type: SchedulerErrorType;
+  public readonly jobId?: string;
+  public readonly phaseId?: number;
+  public readonly projectId?: number;
+  public readonly timestamp: Date;
+
+  constructor(
+    type: SchedulerErrorType,
+    message: string,
+    jobId?: string,
+    phaseId?: number,
+    projectId?: number,
+  ) {
+    super(message);
+    this.name = 'SchedulerOperationError';
+    this.type = type;
+    this.jobId = jobId;
+    this.phaseId = phaseId;
+    this.projectId = projectId;
+    this.timestamp = new Date();
+  }
+
+  /**
+   * Returns a safe, serializable representation of the error
+   */
+  toSafeObject(): Omit<SchedulerError, 'originalError'> {
+    return {
+      type: this.type,
+      message: this.message,
+      jobId: this.jobId,
+      phaseId: this.phaseId,
+      projectId: this.projectId,
+      timestamp: this.timestamp,
+    };
+  }
+}
+
 @Injectable()
-export class SchedulerService implements ISchedulerService, OnModuleInit {
+export class SchedulerService
+  implements ISchedulerService, OnModuleInit, OnModuleDestroy
+{
   private readonly logger = new Logger(SchedulerService.name);
   private readonly activeJobs = new Map<string, JobMetadata>();
+  private readonly completedJobCleanupTimeouts = new Map<
+    string,
+    NodeJS.Timeout
+  >();
 
   constructor(
     private schedulerRegistry: SchedulerRegistry,
@@ -28,6 +81,43 @@ export class SchedulerService implements ISchedulerService, OnModuleInit {
     await this.cleanupOrphanedJobs();
   }
 
+  /**
+   * Clean up all resources when the module is destroyed
+   * Prevents memory leaks by clearing all timeouts and jobs
+   */
+  async onModuleDestroy(): Promise<void> {
+    this.logger.log('SchedulerService shutting down, cleaning up resources...');
+
+    // Clear all cleanup timeouts to prevent memory leaks
+    this.completedJobCleanupTimeouts.forEach((timeout, jobId) => {
+      clearTimeout(timeout);
+      this.logger.debug(`Cleared cleanup timeout for job: ${jobId}`);
+    });
+    this.completedJobCleanupTimeouts.clear();
+
+    // Cancel all active jobs
+    const activeJobIds = Array.from(this.activeJobs.keys());
+    for (const jobId of activeJobIds) {
+      try {
+        await this.cancelScheduledTransition(jobId);
+      } catch (error) {
+        this.logger.warn(
+          `Failed to cancel job ${jobId} during shutdown:`,
+          error,
+        );
+      }
+    }
+
+    this.logger.log('SchedulerService shutdown completed');
+  }
+
+  /**
+   * Schedule a phase transition at a specific time
+   *
+   * @param phaseData - Phase transition data including timing and metadata
+   * @returns Promise<string> - Unique job ID for the scheduled transition
+   * @throws SchedulerOperationError - If scheduling fails or validation errors occur
+   */
   async schedulePhaseTransition(
     phaseData: PhaseTransitionScheduleDto,
   ): Promise<string> {
@@ -43,14 +133,13 @@ export class SchedulerService implements ISchedulerService, OnModuleInit {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     if (scheduleTime <= now) {
-      const error = this.createSchedulerError(
+      throw new SchedulerOperationError(
         SchedulerErrorType.PAST_SCHEDULE_TIME,
         `Cannot schedule phase transition in the past. Schedule time: ${scheduleTime.toISOString()}, Current time: ${now.toISOString()}`,
         undefined,
         phaseData.phaseId,
         phaseData.projectId,
       );
-      throw new Error(JSON.stringify(error));
     }
 
     // Generate unique job ID
@@ -58,14 +147,13 @@ export class SchedulerService implements ISchedulerService, OnModuleInit {
 
     // Check for duplicate jobs
     if (this.activeJobs.has(jobId)) {
-      const error = this.createSchedulerError(
+      throw new SchedulerOperationError(
         SchedulerErrorType.DUPLICATE_JOB,
         `Job already exists for phase ${phaseData.phaseId} in project ${phaseData.projectId}`,
         jobId,
         phaseData.phaseId,
         phaseData.projectId,
       );
-      throw new Error(JSON.stringify(error));
     }
 
     try {
@@ -100,18 +188,23 @@ export class SchedulerService implements ISchedulerService, OnModuleInit {
         `Failed to schedule phase transition for phase ${phaseData.phaseId}`,
         error,
       );
-      const schedulerError = this.createSchedulerError(
+      throw new SchedulerOperationError(
         SchedulerErrorType.SCHEDULING_FAILED,
         `Failed to schedule phase transition: ${error instanceof Error ? error.message : String(error)}`,
         undefined,
         phaseData.phaseId,
         phaseData.projectId,
-        error instanceof Error ? error : undefined,
       );
-      throw new Error(JSON.stringify(schedulerError));
     }
   }
 
+  /**
+   * Cancel a previously scheduled phase transition
+   *
+   * @param jobId - Unique identifier of the job to cancel
+   * @returns Promise<boolean> - True if job was successfully cancelled, false if job not found
+   * @throws SchedulerOperationError - If cancellation fails
+   */
   async cancelScheduledTransition(jobId: string): Promise<boolean> {
     this.logger.log(`Cancelling scheduled transition: ${jobId}`);
 
@@ -134,6 +227,13 @@ export class SchedulerService implements ISchedulerService, OnModuleInit {
         );
       }
 
+      // Clear any pending cleanup timeout
+      const cleanupTimeout = this.completedJobCleanupTimeouts.get(jobId);
+      if (cleanupTimeout) {
+        clearTimeout(cleanupTimeout);
+        this.completedJobCleanupTimeouts.delete(jobId);
+      }
+
       // Update job status and cleanup
       jobMetadata.status = 'cancelled';
       this.activeJobs.delete(jobId);
@@ -145,15 +245,11 @@ export class SchedulerService implements ISchedulerService, OnModuleInit {
         `Failed to cancel scheduled transition: ${jobId}`,
         error,
       );
-      const schedulerError = this.createSchedulerError(
+      throw new SchedulerOperationError(
         SchedulerErrorType.CANCELLATION_FAILED,
         `Failed to cancel job: ${error instanceof Error ? error.message : String(error)}`,
         jobId,
-        undefined,
-        undefined,
-        error instanceof Error ? error : undefined,
       );
-      throw new Error(JSON.stringify(schedulerError));
     }
   }
 
@@ -166,12 +262,11 @@ export class SchedulerService implements ISchedulerService, OnModuleInit {
     // Cancel existing job
     const cancelled = await this.cancelScheduledTransition(jobId);
     if (!cancelled) {
-      const error = this.createSchedulerError(
+      throw new SchedulerOperationError(
         SchedulerErrorType.JOB_NOT_FOUND,
         `Cannot update non-existent job: ${jobId}`,
         jobId,
       );
-      throw new Error(JSON.stringify(error));
     }
 
     try {
@@ -187,15 +282,11 @@ export class SchedulerService implements ISchedulerService, OnModuleInit {
         `Failed to update scheduled transition: ${jobId}`,
         error,
       );
-      const schedulerError = this.createSchedulerError(
+      throw new SchedulerOperationError(
         SchedulerErrorType.SCHEDULING_FAILED,
         `Failed to update job: ${error instanceof Error ? error.message : String(error)}`,
         jobId,
-        undefined,
-        undefined,
-        error instanceof Error ? error : undefined,
       );
-      throw new Error(JSON.stringify(schedulerError));
     }
   }
 
@@ -257,11 +348,15 @@ export class SchedulerService implements ISchedulerService, OnModuleInit {
         // Update job status to completed
         jobMetadata.status = 'completed';
 
-        // Clean up completed job after a delay to allow for monitoring
-        setTimeout(() => {
+        // Schedule cleanup with proper timeout tracking to prevent memory leaks
+        const cleanupTimeout = setTimeout(() => {
           this.activeJobs.delete(jobId);
+          this.completedJobCleanupTimeouts.delete(jobId);
           this.logger.log(`Cleaned up completed job: ${jobId}`);
         }, 300000); // 5 minutes
+
+        // Track the timeout for proper cleanup
+        this.completedJobCleanupTimeouts.set(jobId, cleanupTimeout);
       } catch (error) {
         this.logger.error(
           `Failed to execute phase transition job: ${jobId}`,
@@ -274,6 +369,16 @@ export class SchedulerService implements ISchedulerService, OnModuleInit {
           jobMetadata.lastError =
             error instanceof Error ? error.message : String(error);
           jobMetadata.retryCount = (jobMetadata.retryCount || 0) + 1;
+
+          // Schedule cleanup for failed jobs as well to prevent memory leaks
+          const failedJobCleanupTimeout = setTimeout(() => {
+            this.activeJobs.delete(jobId);
+            this.completedJobCleanupTimeouts.delete(jobId);
+            this.logger.log(`Cleaned up failed job: ${jobId}`);
+          }, 600000); // 10 minutes for failed jobs
+
+          // Track the timeout for proper cleanup
+          this.completedJobCleanupTimeouts.set(jobId, failedJobCleanupTimeout);
         }
       } finally {
         // Remove from scheduler registry as the job is complete (whether successful or failed)
