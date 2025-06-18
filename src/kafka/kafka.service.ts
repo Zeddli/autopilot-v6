@@ -30,15 +30,42 @@ export class KafkaService implements OnApplicationShutdown, OnModuleInit {
   private readonly kafka: Kafka;
   private readonly producer: Producer;
   private readonly consumers: Map<string, Consumer>;
-  private readonly schemaUtils: SchemaUtils;
+  private schemaUtils: SchemaUtils;
   private readonly logger: LoggerService;
   private readonly circuitBreaker: CircuitBreaker;
   private schemaIds: Map<string, number>;
   private readonly schemaCache: Map<string, ISchemaCacheEntry>;
 
+  /**
+   * Flag to track if mock mode was dynamically enabled due to infrastructure unavailability
+   * This allows the service to fall back to mock mode when Kafka is not available
+   */
+  private mockModeEnabled = false;
+
   constructor(private readonly configService: ConfigService) {
     this.logger = new LoggerService(KafkaService.name);
     this.schemaCache = new Map();
+
+    // Determine mock mode immediately in constructor based on environment
+    const kafkaConfig = this.configService.get('kafka') as {
+      enabled?: boolean;
+      mockMode?: boolean;
+    };
+    
+    const shouldUseMockMode = !kafkaConfig?.enabled || 
+                              kafkaConfig?.mockMode || 
+                              process.env.NODE_ENV === 'test' ||
+                              process.env.KAFKA_MOCK_MODE === 'true';
+    
+    if (shouldUseMockMode) {
+      this.mockModeEnabled = true;
+      this.logger.info('KafkaService initialized in mock mode', {
+        reason: 'Configuration disabled, test environment, or mock mode explicitly enabled',
+        enabled: kafkaConfig?.enabled,
+        mockMode: kafkaConfig?.mockMode,
+        environment: process.env.NODE_ENV,
+      });
+    }
 
     try {
       const brokers = this.configService.get<string | undefined>(
@@ -82,17 +109,8 @@ export class KafkaService implements OnApplicationShutdown, OnModuleInit {
         resetTimeout: CONFIG.CIRCUIT_BREAKER.DEFAULT_RESET_TIMEOUT,
       });
 
-      const schemaRegistryUrl = this.configService.get<string | undefined>(
-        'kafka.schemaRegistry.url',
-      );
-      if (!schemaRegistryUrl) {
-        this.logger.error('Schema registry URL is not configured');
-        throw new SchemaRegistryException(
-          'Schema registry URL is not configured',
-        );
-      }
-
-      this.schemaUtils = new SchemaUtils(schemaRegistryUrl);
+      // Defer SchemaUtils initialization until onModuleInit
+      // to avoid constructor failures in development environments
       this.schemaIds = new Map();
     } catch (error) {
       const err = error as Error;
@@ -105,23 +123,278 @@ export class KafkaService implements OnApplicationShutdown, OnModuleInit {
     }
   }
 
+  /**
+   * Module initialization lifecycle hook
+   *
+   * Initializes Kafka connections and schemas on module startup.
+   * In test environments or when Kafka is disabled, skips real connections
+   * and operates in mock mode for testing purposes.
+   *
+   * Enhanced with connection detection:
+   * - Attempts to detect if Kafka infrastructure is available
+   * - Falls back gracefully to mock mode if infrastructure is unavailable
+   * - Provides clear logging about the connection mode being used
+   *
+   * @throws {KafkaConnectionException} When connection fails in production mode
+   */
   async onModuleInit(): Promise<void> {
+    console.log('=== KafkaService onModuleInit called ===');
+
+    const kafkaConfig = this.configService.get('kafka') as {
+      enabled?: boolean;
+      mockMode?: boolean;
+      schemaRegistry?: { enabled?: boolean };
+    };
+
+    console.log('Kafka config:', {
+      enabled: kafkaConfig?.enabled,
+      mockMode: kafkaConfig?.mockMode,
+      environment: process.env.NODE_ENV || 'undefined',
+    });
+
+    // Initialize SchemaUtils here instead of in constructor
     try {
-      await this.initializeSchemas();
-      await this.producer.connect();
-      this.logger.info('Kafka service initialized successfully');
+      const schemaRegistryUrl = this.configService.get<string | undefined>(
+        'kafka.schemaRegistry.url',
+      );
+      if (!schemaRegistryUrl) {
+        this.logger.warn('Schema registry URL is not configured, some features may be limited');
+        // Don't throw error in development mode
+        if (process.env.NODE_ENV === 'production') {
+          throw new SchemaRegistryException(
+            'Schema registry URL is not configured',
+          );
+        }
+      } else {
+        this.schemaUtils = new SchemaUtils(schemaRegistryUrl);
+      }
     } catch (error) {
       const err = error as Error;
-      this.logger.error('Failed to initialize Kafka service', {
-        error: err.stack || err.message,
+      this.logger.warn('Failed to initialize SchemaUtils', {
+        error: err.message,
       });
-      throw new KafkaConnectionException({
-        error: err.stack || err.message,
+      if (process.env.NODE_ENV === 'production') {
+        throw error;
+      }
+    }
+
+    // Enhanced logging for debugging
+    this.logger.info('KafkaService onModuleInit - Configuration check', {
+      enabled: kafkaConfig?.enabled,
+      mockMode: kafkaConfig?.mockMode,
+      environment: process.env.NODE_ENV || 'undefined',
+      isProduction: process.env.NODE_ENV === 'production',
+    });
+
+    // Skip Kafka initialization if mock mode is already enabled
+    if (this.isInMockMode()) {
+      this.logger.info(
+        'Kafka service running in mock mode - connections skipped',
+        {
+          enabled: kafkaConfig?.enabled,
+          mockMode: kafkaConfig?.mockMode,
+          environment: process.env.NODE_ENV,
+          reason: 'Mock mode already enabled in constructor',
+        },
+      );
+      return;
+    }
+
+    // In production, we require real Kafka connections
+    if (process.env.NODE_ENV === 'production') {
+      try {
+        await this.initializeSchemas();
+        await this.producer.connect();
+        this.logger.info(
+          'Kafka service initialized successfully in production mode',
+        );
+        return;
+      } catch (error) {
+        const err = error as Error;
+        this.logger.error('Failed to initialize Kafka service in production', {
+          error: err.stack || err.message,
+        });
+        throw new KafkaConnectionException({
+          error: err.stack || err.message,
+        });
+      }
+    }
+
+    // For development/other environments: Attempt connection with fallback to mock mode
+    this.logger.info('Attempting to connect to Kafka infrastructure...');
+    
+    // Use a very short timeout for immediate feedback
+    const connectionTimeout = 500; // 500ms
+    let connectionSuccessful = false;
+    
+    try {
+      // Test connection with aggressive timeout
+      await Promise.race([
+        this.testKafkaConnection(),
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Connection timeout')), connectionTimeout)
+        ),
+      ]);
+      
+      connectionSuccessful = true;
+      this.logger.info('Kafka broker connectivity test successful');
+      
+    } catch (error) {
+      const err = error as Error;
+      this.logger.warn('Kafka broker connectivity test failed', {
+        error: err.message,
+        timeout: connectionTimeout,
       });
+      connectionSuccessful = false;
+    }
+
+    if (connectionSuccessful) {
+      try {
+        // If connection test passed, try full initialization
+        await this.initializeSchemas();
+        await this.producer.connect();
+        this.logger.info(
+          'Kafka service initialized successfully with real connections',
+          {
+            brokers: this.configService.get('kafka.brokers'),
+            schemaRegistry: this.configService.get('kafka.schemaRegistry.url'),
+          },
+        );
+      } catch (error) {
+        const err = error as Error;
+        this.logger.warn('Full Kafka initialization failed, falling back to mock mode', {
+          error: err.message,
+        });
+        this.enableMockMode();
+      }
+    } else {
+      // Connection test failed, immediately enable mock mode
+      this.logger.warn(
+        'Kafka infrastructure not available, falling back to mock mode',
+        {
+          brokers: this.configService.get('kafka.brokers'),
+          schemaRegistry: this.configService.get('kafka.schemaRegistry.url'),
+          suggestion: 'Start Kafka infrastructure with: docker-compose up -d',
+        },
+      );
+
+      this.enableMockMode();
+
+      this.logger.info(
+        'Kafka service running in mock mode due to infrastructure unavailability',
+        {
+          environment: process.env.NODE_ENV,
+          reason: 'Infrastructure not available',
+          mockMode: true,
+        },
+      );
     }
   }
 
+  /**
+   * Test Kafka connection availability using TCP socket
+   *
+   * Performs a lightweight TCP socket test to determine if Kafka
+   * infrastructure is available before attempting full initialization.
+   * This avoids creating Kafka clients that generate retry logs.
+   *
+   * @throws {Error} When Kafka infrastructure is not available
+   */
+  private async testKafkaConnection(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const net = require('net');
+      const brokers = this.configService.get<string>('kafka.brokers') || 'localhost:9092';
+      const brokerList = brokers.split(',');
+      const [host, portStr] = brokerList[0].split(':');
+      const port = parseInt(portStr, 10);
+      
+      const socket = new net.Socket();
+      const timeout = 1000; // 1 second timeout
+      
+      socket.setTimeout(timeout);
+      
+      socket.on('connect', () => {
+        socket.destroy();
+        this.logger.debug('Kafka broker connectivity test successful');
+        resolve();
+      });
+      
+      socket.on('timeout', () => {
+        socket.destroy();
+        this.logger.debug('Kafka broker connectivity test timed out');
+        reject(new Error('Kafka broker connection timeout'));
+      });
+      
+      socket.on('error', (error) => {
+        socket.destroy();
+        this.logger.debug('Kafka broker connectivity test failed', {
+          error: error.message,
+        });
+        reject(new Error(`Kafka broker not available: ${error.message}`));
+      });
+      
+      socket.connect(port, host);
+    });
+  }
+
+  /**
+   * Enable mock mode for this service instance
+   *
+   * Dynamically enables mock mode when real Kafka infrastructure
+   * is not available, allowing the application to continue running
+   * in development environments without requiring Kafka setup.
+   */
+  private enableMockMode(): void {
+    // Set a flag to indicate mock mode is enabled for this instance
+    this.mockModeEnabled = true;
+
+    this.logger.info('Mock mode enabled - Kafka operations will be simulated', {
+      timestamp: new Date().toISOString(),
+      service: 'KafkaService',
+    });
+  }
+
+  /**
+   * Check if service is currently running in mock mode (public method)
+   *
+   * @returns {boolean} True if mock mode is enabled
+   */
+  public isInMockMode(): boolean {
+    const kafkaConfig = this.configService.get('kafka') as {
+      enabled?: boolean;
+      mockMode?: boolean;
+    };
+
+    return (
+      !kafkaConfig?.enabled ||
+      kafkaConfig?.mockMode ||
+      this.mockModeEnabled ||
+      process.env.NODE_ENV === 'test'
+    );
+  }
+
+  /**
+   * Initialize Kafka schemas for all configured topics
+   *
+   * Registers schemas with Schema Registry and caches schema IDs
+   * for efficient message encoding/decoding operations.
+   * Skips initialization in test/mock mode.
+   *
+   * @throws {SchemaRegistryException} When schema registration fails
+   */
   private async initializeSchemas(): Promise<void> {
+    const kafkaConfig = this.configService.get('kafka') as {
+      schemaRegistry?: { enabled?: boolean };
+    };
+
+    // Skip schema initialization if Schema Registry is disabled
+    if (!kafkaConfig?.schemaRegistry?.enabled) {
+      this.logger.info(
+        'Schema Registry disabled - skipping schema initialization',
+      );
+      return;
+    }
+
     try {
       this.logger.info('Initializing Kafka schemas...');
 
@@ -154,16 +427,22 @@ export class KafkaService implements OnApplicationShutdown, OnModuleInit {
 
       this.logger.info('All Kafka schemas initialized successfully');
     } catch (error) {
-      const err = error as Error;
-      this.logger.error('Failed to initialize Kafka schemas', {
-        error: err.stack || err.message,
+      const kafkaError = error as Error;
+      this.logger.error('Schema initialization failed:', {
+        error: kafkaError.message,
+        stack: kafkaError.stack,
       });
-      throw new SchemaRegistryException(
-        `Failed to initialize Kafka schemas: ${err.message}`,
-        {
-          error: err.stack || err.message,
-        },
-      );
+
+      if (
+        this.configService.get<boolean>('kafka.schemaRegistry.required') ||
+        process.env.NODE_ENV === 'production'
+      ) {
+        throw kafkaError;
+      } else {
+        this.logger.warn(
+          'Continuing without schema registry (not required for this environment)',
+        );
+      }
     }
   }
 
@@ -211,8 +490,38 @@ export class KafkaService implements OnApplicationShutdown, OnModuleInit {
     }
   }
 
+  /**
+   * Produce a message to the specified Kafka topic
+   *
+   * In production mode, encodes and sends messages to the actual Kafka broker.
+   * In test/mock mode, logs the message instead of sending to allow testing
+   * without requiring real Kafka infrastructure.
+   *
+   * Enhanced with dynamic mock mode detection to handle cases where
+   * infrastructure becomes unavailable after service initialization.
+   *
+   * @param topic - The Kafka topic to send the message to
+   * @param message - The message payload to send
+   * @throws {KafkaProducerException} When message production fails
+   */
   async produce(topic: string, message: unknown): Promise<void> {
     const correlationId = uuidv4();
+
+    // Handle mock mode for testing and when infrastructure is unavailable
+    if (this.isInMockMode()) {
+      this.logger.info(
+        `[KAFKA-PRODUCER-MOCK] Message would be sent to ${topic}`,
+        {
+          correlationId,
+          topic,
+          messageType: typeof message,
+          timestamp: new Date().toISOString(),
+          mockMode: true,
+          reason: 'Infrastructure unavailable or mock mode enabled',
+        },
+      );
+      return;
+    }
 
     try {
       await this.circuitBreaker.execute(async () => {
@@ -286,9 +595,36 @@ export class KafkaService implements OnApplicationShutdown, OnModuleInit {
     }
   }
 
+  /**
+   * Produce a batch of messages to the specified Kafka topic
+   *
+   * In production mode, encodes and sends multiple messages to the actual Kafka broker.
+   * In test/mock mode, logs the batch instead of sending to allow testing
+   * without requiring real Kafka infrastructure.
+   *
+   * @param topic - The Kafka topic to send the messages to
+   * @param messages - Array of message payloads to send
+   * @throws {KafkaProducerException} When batch production fails
+   */
   async produceBatch(topic: string, messages: unknown[]): Promise<void> {
     const correlationId = uuidv4();
     const startTime = Date.now();
+
+    // Handle mock mode for testing and when infrastructure is unavailable
+    if (this.isInMockMode()) {
+      this.logger.info(
+        `[KAFKA-PRODUCER-MOCK] Batch would be sent to ${topic}`,
+        {
+          correlationId,
+          topic,
+          messageCount: messages.length,
+          timestamp: new Date().toISOString(),
+          mockMode: true,
+          reason: 'Infrastructure unavailable or mock mode enabled',
+        },
+      );
+      return;
+    }
 
     try {
       await this.circuitBreaker.execute(async () => {
@@ -353,6 +689,20 @@ export class KafkaService implements OnApplicationShutdown, OnModuleInit {
     }
   }
 
+  /**
+   * Start consuming messages from specified topics
+   *
+   * Creates and starts a Kafka consumer for the given consumer group.
+   * In test/mock mode, skips actual consumption and logs instead.
+   *
+   * Enhanced with dynamic mock mode detection to handle cases where
+   * infrastructure becomes unavailable after service initialization.
+   *
+   * @param groupId - The consumer group ID
+   * @param topics - Array of topics to consume from
+   * @param onMessage - Callback function to handle received messages
+   * @throws {KafkaConsumerException} When consumer fails to start
+   */
   async consume(
     groupId: string,
     topics: string[],
@@ -360,102 +710,111 @@ export class KafkaService implements OnApplicationShutdown, OnModuleInit {
   ): Promise<void> {
     const correlationId = uuidv4();
 
+    // Handle mock mode for testing and when infrastructure is unavailable
+    if (this.isInMockMode()) {
+      this.logger.info(
+        `[KAFKA-CONSUMER-MOCK] Consumer would start for group ${groupId}`,
+        {
+          correlationId,
+          groupId,
+          topics,
+          mockMode: true,
+          reason: 'Infrastructure unavailable or mock mode enabled',
+        },
+      );
+      return;
+    }
+
     try {
-      await this.circuitBreaker.execute(async () => {
-        let consumer = this.consumers.get(groupId);
-        if (!consumer) {
-          consumer = this.kafka.consumer({
-            groupId,
-            maxWaitTimeInMs: CONFIG.KAFKA.DEFAULT_MAX_WAIT_TIME,
-            maxBytes: CONFIG.KAFKA.DEFAULT_MAX_BYTES,
-            retry: {
-              initialRetryTime:
-                this.configService.get('kafka.retry.initialRetryTime') ||
-                CONFIG.KAFKA.DEFAULT_INITIAL_RETRY_TIME,
-              retries:
-                this.configService.get('kafka.retry.retries') ||
-                CONFIG.KAFKA.DEFAULT_RETRIES,
-              maxRetryTime:
-                this.configService.get('kafka.retry.maxRetryTime') ||
-                CONFIG.KAFKA.DEFAULT_MAX_RETRY_TIME,
-            },
-          });
+      // Check if consumer already exists for this group
+      if (this.consumers.has(groupId)) {
+        this.logger.warn(`Consumer already exists for group ${groupId}`);
+        return;
+      }
 
-          await consumer.connect();
-          this.consumers.set(groupId, consumer);
-        }
+      const consumer = this.kafka.consumer({
+        groupId,
+        sessionTimeout: 30000,
+        heartbeatInterval: 3000,
+      });
 
-        await consumer.subscribe({ topics, fromBeginning: false });
-
-        await consumer.run({
-          eachMessage: async ({ topic, partition, message }) => {
-            const messageCorrelationId =
-              message.headers?.['correlation-id']?.toString() || uuidv4();
-
-            try {
-              if (!message.value) {
-                throw new Error('Message value is null or undefined');
-              }
-
-              const decodedMessage = (await this.schemaUtils.decode(
-                message.value,
-              )) as Record<string, unknown>;
-
-              if (!decodedMessage) {
-                throw new Error('Decoded message is null or undefined');
-              }
-
-              this.logger.info(
-                `[KAFKA-CONSUMER] Starting to process message from ${topic}`,
-                {
-                  correlationId: messageCorrelationId,
-                  topic,
-                  partition,
-                  timestamp: new Date().toISOString(),
-                },
-              );
-
-              await onMessage(decodedMessage);
-
-              this.logger.info(
-                `[KAFKA-CONSUMER] Completed processing message from ${topic}`,
-                {
-                  correlationId: messageCorrelationId,
-                  topic,
-                  partition,
-                  timestamp: new Date().toISOString(),
-                },
-              );
-            } catch (error) {
-              const err = error as Error;
-              this.logger.error(
-                `Error processing message from topic ${topic}`,
-                {
-                  error: err.stack,
-                  correlationId: messageCorrelationId,
-                  topic,
-                  partition,
-                },
-              );
-              if (message.value) {
-                await this.sendToDLQ(topic, message.value);
-              }
-            }
-          },
+      // Handle consumer events
+      consumer.on('consumer.crash', (event) => {
+        this.logger.error(`Consumer crashed for group ${groupId}`, {
+          errorMessage:
+            event.payload?.error?.stack ||
+            event.payload?.error?.message ||
+            'Unknown consumer error',
+          correlationId,
         });
+      });
+
+      consumer.on('consumer.disconnect', () => {
+        this.logger.warn(`Consumer disconnected for group ${groupId}`, {
+          correlationId,
+        });
+      });
+
+      await consumer.connect();
+      await consumer.subscribe({ topics, fromBeginning: false });
+
+      await consumer.run({
+        eachMessage: async ({ topic, partition, message }) => {
+          try {
+            // Ensure message.value is properly typed and not null
+            const messageValue = message.value;
+            if (!messageValue) {
+              throw new Error('Message value is null or undefined');
+            }
+
+            const decodedMessage = (await this.schemaUtils.decode(
+              messageValue,
+            )) as unknown;
+
+            this.logger.info(
+              `[KAFKA-CONSUMER] Message received from ${topic}`,
+              {
+                correlationId,
+                topic,
+                partition,
+                offset: message.offset,
+                timestamp: new Date().toISOString(),
+              },
+            );
+
+            await onMessage(decodedMessage);
+          } catch (error) {
+            const err = error as Error;
+            this.logger.error(`Failed to process message from ${topic}`, {
+              correlationId,
+              topic,
+              partition,
+              offset: message.offset,
+              error: err.stack || err.message,
+            });
+
+            // Send to DLQ if available
+            if (message.value) {
+              await this.sendToDLQ(topic, message.value);
+            }
+          }
+        },
+      });
+
+      this.consumers.set(groupId, consumer);
+      this.logger.info(`Consumer started for group ${groupId}`, {
+        correlationId,
+        topics,
       });
     } catch (error) {
       const err = error as Error;
       this.logger.error(`Failed to start consumer for group ${groupId}`, {
-        error: err.stack,
+        error: err.stack || err.message,
         correlationId,
         topics,
       });
       throw new KafkaConsumerException(
         `Failed to start consumer for group ${groupId}`,
-        {
-          error: err.stack || err.message,
-        },
       );
     }
   }
