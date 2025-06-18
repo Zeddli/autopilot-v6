@@ -6,7 +6,7 @@ import { KafkaModule } from '../kafka/kafka.module';
 import { SchedulerModule } from '../scheduler/scheduler.module';
 
 @Module({
-  imports: [forwardRef(() => KafkaModule), SchedulerModule],
+  imports: [forwardRef(() => KafkaModule), forwardRef(() => SchedulerModule)],
   providers: [
     AutopilotService,
     ScheduleAdjustmentService,
