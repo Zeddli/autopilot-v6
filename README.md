@@ -4,13 +4,15 @@ autopilot operations with Kafka integration.
 
 ## Features
 
-- Kafka message production and consumption
-- Schema Registry integration for Avro message serialization
-- Health check endpoints for Kafka and application monitoring
-- Structured logging with Winston
-- Environment-based configuration
-- Graceful shutdown handling
-- Error handling and validation
+- **Intelligent Kafka Integration** with automatic fallback to mock mode
+- **Enhanced Connection Detection** for development environments
+- **Schema Registry Integration** for Avro message serialization
+- **Graceful Infrastructure Handling** - works with or without Kafka
+- **Health Check Endpoints** for comprehensive system monitoring
+- **Structured Logging** with Winston
+- **Environment-Based Configuration** with smart defaults
+- **Graceful Shutdown Handling** and error recovery
+- **Robust Error Handling** and validation
 
 ## Prerequisites
 
@@ -61,6 +63,10 @@ pnpm install
 
 ### 4. Development Setup
 
+The application features **intelligent infrastructure detection** and will work in multiple modes:
+
+#### Option A: Full Kafka Development (Recommended)
+
 1. Start Kafka infrastructure using Docker Compose:
 ```bash
 docker compose up -d
@@ -84,30 +90,122 @@ docker compose logs
 http://localhost:8080
 ```
 
-3. Start the application locally:
+3. Start the application:
 ```bash
 # Using the start script
 ./start-local.sh
 
-# Or manually with environment variables
+# Or manually
 npm run start:dev
+```
+
+#### Option B: Quick Start (No Infrastructure Required)
+
+**The application will automatically detect missing infrastructure and enable mock mode:**
+
+```bash
+# Simply start the application - it auto-detects and falls back to mock mode
+npm run start:dev
+```
+
+**Expected behavior:**
+- ✅ Application starts successfully in ~2-3 seconds
+- ✅ Kafka operations are simulated (mock mode)
+- ✅ All APIs remain functional
+- ✅ Perfect for quick development and testing
+
+#### Option C: Explicit Mock Mode
+
+```bash
+# Force mock mode explicitly
+KAFKA_MOCK_MODE=true npm run start:dev
+
+# Or disable Kafka entirely
+KAFKA_ENABLED=false npm run start:dev
 ```
 
 ### 5. Verify Installation
 
-1. Check if the application is running:
+1. **Check Application Status**:
 ```bash
+# Basic health check
 curl http://localhost:3000/health
+
+# Detailed system status (shows Kafka mode)
+curl http://localhost:3000/health/detailed
+
+# Kafka-specific status
+curl http://localhost:3000/health/kafka
 ```
 
-2. Access Kafka UI:
-- Open http://localhost:8080 in your browser
-- Verify Kafka cluster connection
-- Check Schema Registry status
+2. **Browser Verification**:
+```bash
+# Open in browser - should show structured 404 (proves app is running)
+http://localhost:3000
 
-3. Access Schema Registry:
-- Open http://localhost:8081 in your browser
-- Verify schemas are registered
+# Health check endpoint
+http://localhost:3000/health
+```
+
+3. **Infrastructure Verification** (if using full Kafka setup):
+- **Kafka UI**: http://localhost:8080 - Monitor topics and consumers
+- **Schema Registry**: http://localhost:8081 - View registered schemas
+
+4. **Expected Behaviors**:
+   - ✅ **With Kafka**: Real message publishing, consumer processing
+   - ✅ **Without Kafka**: Mock mode enabled, simulated operations
+   - ✅ **Both modes**: All health endpoints functional, API responses normal
+
+## Intelligent Infrastructure Detection
+
+The application features enhanced connection detection that automatically handles infrastructure availability:
+
+### How It Works
+
+1. **Fast Detection**: Uses lightweight TCP socket tests (500ms timeout)
+2. **Graceful Fallback**: Automatically enables mock mode when infrastructure is unavailable
+3. **Zero Configuration**: Works out-of-the-box without manual mock mode setup
+4. **Environment Aware**: Behaves differently in development vs production
+
+### Operating Modes
+
+| Environment | Kafka Available | Behavior |
+|-------------|----------------|----------|
+| Development | ✅ Yes | Full Kafka integration |
+| Development | ❌ No | **Auto-fallback to mock mode** |
+| Test | N/A | Always mock mode |
+| Production | ✅ Yes | Full Kafka integration |
+| Production | ❌ No | **Fails fast** (intended behavior) |
+
+### Startup Messages
+
+**With Kafka Infrastructure:**
+```
+[KafkaService] Kafka broker connectivity test successful
+[KafkaService] Kafka service initialized successfully with real connections
+[MessageConsumer] Message consumer initialized successfully
+```
+
+**Without Kafka Infrastructure (Auto-Mock Mode):**
+```
+[KafkaService] Kafka broker connectivity test failed
+[KafkaService] Kafka infrastructure not available, falling back to mock mode
+[KafkaService] Mock mode enabled - Kafka operations will be simulated
+[MessageConsumer] KafkaService is in mock mode - message consumer will not start
+```
+
+### Configuration Options
+
+```bash
+# Force mock mode (overrides detection)
+KAFKA_MOCK_MODE=true
+
+# Disable Kafka entirely
+KAFKA_ENABLED=false
+
+# Production mode (requires real Kafka)
+NODE_ENV=production
+```
 
 # Test coverage
 
@@ -123,9 +221,31 @@ $ npm run lint
 
 ### Health Checks
 
-- `GET /health` - Overall health check including Kafka
-- `GET /health/kafka` - Kafka-specific health check
-- `GET /health/app` - Application health check
+- `GET /health` - Overall health check including Kafka status
+- `GET /health/detailed` - Comprehensive system status with all services
+- `GET /health/kafka` - Kafka-specific health check (shows mock/real mode)
+- `GET /health/scheduler` - Scheduler service health
+- `GET /health/recovery` - Recovery service health  
+- `GET /health/app` - Basic application health check
+
+### Kafka Operations
+
+- `POST /kafka/phase-transition` - Send phase transition events
+- `POST /kafka/challenge-update` - Send challenge update events
+- `POST /kafka/command` - Send autopilot commands
+
+### Expected API Behavior
+
+**Root Endpoint (`GET /`):**
+```json
+{
+  "timestamp": "2025-06-18T02:47:20.749Z",
+  "statusCode": 404,
+  "message": "Cannot GET /",
+  "data": {}
+}
+```
+This is **normal and expected** - it proves the application is running correctly and handling requests.
 
 ## Kafka Topics
 

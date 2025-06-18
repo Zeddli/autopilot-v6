@@ -1,0 +1,92 @@
+Challenge Overview
+The Topcoder Autopilot service is responsible for automatically transitioning challenges through their phases at the appropriate times. In the first challenge, we established the core project infrastructure and integrated with Kafka for event messaging. This second challenge focuses on implementing an event-based mechanism to replace the current polling approach, making the system more efficient and responsive.
+
+Technology Stack
+NestJS 10+
+TypeScript 5+
+@nestjs/schedule module
+Kafka
+ESLint and Prettier for code formatting
+Docker
+Challenge Background
+The current Autopilot-v6 codebase has established the Kafka infrastructure for sending and receiving events but lacks the core scheduling functionality. While the system can manually trigger events, there's no automated scheduling mechanism to trigger them at specific phase end times. This challenge aims to implement this functionality using NestJS's scheduling capabilities.
+
+Codebase
+https://github.com/topcoder-platform/autopilot-v6.git
+Individual Requirements
+1. Event-Based Scheduling Mechanism
+Implement a dynamic scheduling system using NestJS's @nestjs/schedule module:
+
+Add the @nestjs/schedule module to the project dependencies
+Create a scheduler service that leverages SchedulerRegistry to manage dynamic job registration and cancellation
+Implement methods to schedule one-time tasks based on phase end times
+Each scheduled job should correspond to a specific phase end event
+2. Event Generation
+Enhance the existing Kafka infrastructure to automatically generate events:
+
+At the scheduled time, trigger phase transition events
+Publish these events to the appropriate Kafka topic (autopilot.phase.transition)
+Ensure the event payload includes challenge ID, phase ID, and other relevant metadata as per the existing message format
+3. Schedule Adjustment Handling
+Implement logic to handle changes to phase schedules:
+
+Create handlers for challenge/phase updates that might affect scheduled end times
+Implement logic to cancel existing scheduled jobs when phase end times are changed
+Re-schedule events with updated timing information
+Ensure all schedule changes are properly logged for audit purposes
+4. Resilience and Recovery
+Implement mechanisms to ensure the system can recover from failures:
+
+Create a recovery mechanism that executes when the service restarts
+On startup, scan all active phases and schedule events for upcoming transitions
+Handle edge cases like immediate phase transitions (end times in the past)
+Implement proper error handling and logging throughout the scheduling process
+5. Documentation
+Document the scheduling approach and recovery mechanisms
+Include examples of how the system handles different scenarios (normal scheduling, rescheduling, recovery)
+Implementation Details
+Scheduler Service
+Create a new service that will:
+
+Use the SchedulerRegistry from @nestjs/schedule to manage dynamic jobs
+Provide methods to:
+Schedule a phase transition event
+Cancel a scheduled phase transition
+Update a scheduled phase transition
+Get all scheduled transitions
+Example interface (Just for your reference):
+
+interface SchedulerService {
+  schedulePhaseTransition(phaseData: PhaseTransitionScheduleDto): Promise&lt;string&gt;; // returns job id
+  cancelScheduledTransition(jobId: string): Promise&lt;boolean&gt;;
+  updateScheduledTransition(jobId: string, phaseData: PhaseTransitionScheduleDto): Promise&lt;string&gt;; // returns new job id
+  getAllScheduledTransitions(): Promise&lt;ScheduledTransitionInfo[]&gt;;
+}
+Phase Transition Handler
+Enhance the existing AutopilotService to:
+
+Process phase transition requests
+Schedule phase transitions based on end times
+Handle updates to phase schedules
+Trigger the appropriate Kafka events when transitions occur
+Recovery Mechanism
+Implement a recovery service that:
+
+Runs on application startup
+Fetches all active phases from the challenge service
+Schedules transitions for phases that haven't ended yet
+Immediately processes phases that should have already ended
+Important Notes
+The existing Kafka infrastructure should be leveraged for event publishing
+All scheduled jobs should be properly managed to prevent memory leaks
+The solution should be designed with scalability in mind, potentially allowing for distributed scheduling in the future
+Proper error handling and logging are essential for debugging and monitoring
+All required features are properly implemented
+Ask questions in the challenge forum for clarifications, Do not make assumptions without approval.
+Submission Guideline
+Please submit a git patch against the latest commit in the develop branch of https://github.com/topcoder-platform/autopilot-v6.git, which should include
+
+Complete implementation of the event-based scheduling mechanism
+Integration with the existing Kafka infrastructure
+Documentation on the scheduling approach and recovery mechanisms
+The deployment guide (in markdown format).
