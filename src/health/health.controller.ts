@@ -3,6 +3,7 @@ import { HealthCheck, HealthCheckService } from '@nestjs/terminus';
 import { KafkaHealthIndicator } from './kafka.health';
 import { SchedulerHealthIndicator } from './scheduler.health';
 import { RecoveryHealthIndicator } from './recovery.health';
+import { KafkaService } from '../kafka/kafka.service';
 
 /**
  * Health Controller
@@ -21,6 +22,7 @@ export class HealthController {
     private kafkaHealth: KafkaHealthIndicator,
     private schedulerHealth: SchedulerHealthIndicator,
     private recoveryHealth: RecoveryHealthIndicator,
+    private kafkaService: KafkaService,
   ) {}
 
   /**
@@ -146,5 +148,35 @@ export class HealthController {
       () => this.recoveryHealth.checkConfiguration('recovery-config'),
       () => this.recoveryHealth.checkPerformance('recovery-performance'),
     ]);
+  }
+
+  /**
+   * Debug endpoint to test Kafka service directly
+   */
+  @Get('debug/kafka')
+  async debugKafka() {
+    try {
+      const isConnected = await this.kafkaService.isConnected();
+      const isInMockMode = this.kafkaService.isInMockMode();
+      
+      return {
+        status: 'success',
+        data: {
+          isConnected,
+          isInMockMode,
+          timestamp: new Date().toISOString(),
+        },
+      };
+    } catch (error) {
+      const err = error as Error;
+      return {
+        status: 'error',
+        data: {
+          error: err.message,
+          stack: err.stack,
+          timestamp: new Date().toISOString(),
+        },
+      };
+    }
   }
 }

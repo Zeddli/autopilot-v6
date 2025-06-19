@@ -13,7 +13,18 @@ export class KafkaHealthIndicator extends HealthIndicator {
 
   async isHealthy(key: string) {
     try {
+      this.logger.info('Starting Kafka health check', {
+        key,
+        timestamp: new Date().toISOString(),
+      });
+      
       const isConnected = await this.kafkaService.isConnected();
+      
+      this.logger.info('Kafka health check result', {
+        key,
+        isConnected,
+        timestamp: new Date().toISOString(),
+      });
 
       if (!isConnected) {
         throw new HealthCheckError(
@@ -35,6 +46,8 @@ export class KafkaHealthIndicator extends HealthIndicator {
 
       this.logger.error('Kafka health check failed', {
         error: err.stack,
+        message: err.message,
+        name: err.name,
         timestamp: new Date().toISOString(),
       });
 

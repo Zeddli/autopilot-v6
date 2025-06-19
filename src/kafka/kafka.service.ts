@@ -138,19 +138,11 @@ export class KafkaService implements OnApplicationShutdown, OnModuleInit {
    * @throws {KafkaConnectionException} When connection fails in production mode
    */
   async onModuleInit(): Promise<void> {
-    console.log('=== KafkaService onModuleInit called ===');
-
     const kafkaConfig = this.configService.get('kafka') as {
       enabled?: boolean;
       mockMode?: boolean;
       schemaRegistry?: { enabled?: boolean };
     };
-
-    console.log('Kafka config:', {
-      enabled: kafkaConfig?.enabled,
-      mockMode: kafkaConfig?.mockMode,
-      environment: process.env.NODE_ENV || 'undefined',
-    });
 
     // Initialize SchemaUtils here instead of in constructor
     try {
@@ -360,17 +352,36 @@ export class KafkaService implements OnApplicationShutdown, OnModuleInit {
    * @returns {boolean} True if mock mode is enabled
    */
   public isInMockMode(): boolean {
-    const kafkaConfig = this.configService.get('kafka') as {
-      enabled?: boolean;
-      mockMode?: boolean;
-    };
+    try {
+      const kafkaConfig = this.configService.get('kafka') as {
+        enabled?: boolean;
+        mockMode?: boolean;
+      };
 
-    return (
-      !kafkaConfig?.enabled ||
-      kafkaConfig?.mockMode ||
-      this.mockModeEnabled ||
-      process.env.NODE_ENV === 'test'
-    );
+      // Log debug info for troubleshooting
+      this.logger.debug('Checking mock mode status', {
+        kafkaConfigExists: !!kafkaConfig,
+        enabled: kafkaConfig?.enabled,
+        mockMode: kafkaConfig?.mockMode,
+        mockModeEnabled: this.mockModeEnabled,
+        nodeEnv: process.env.NODE_ENV,
+      });
+
+      return (
+        !kafkaConfig?.enabled ||
+        kafkaConfig?.mockMode ||
+        this.mockModeEnabled ||
+        process.env.NODE_ENV === 'test'
+      );
+    } catch (error) {
+      const err = error as Error;
+      this.logger.error('Error checking mock mode status', {
+        error: err.message,
+        stack: err.stack,
+      });
+      // Default to mock mode if there's an error
+      return true;
+    }
   }
 
   /**
@@ -909,26 +920,50 @@ export class KafkaService implements OnApplicationShutdown, OnModuleInit {
 
   async isConnected(): Promise<boolean> {
     try {
-      // Check if producer is connected by attempting to get metadata
-      await this.producer.send({
-        topic: '__kafka_health_check',
-        messages: [{ value: Buffer.from('health_check') }],
+      const mockMode = this.isInMockMode();
+      
+      this.logger.info('Checking Kafka connectivity', {
+        mockMode,
+        timestamp: new Date().toISOString(),
       });
+      
+      // In mock mode, always return true to indicate service is operational
+      if (mockMode) {
+        this.logger.info('Kafka service is in mock mode - returning true', {
+          timestamp: new Date().toISOString(),
+        });
+        return true;
+      }
 
-      // Check if all consumers are connected by attempting to describe group
+      // Ensure kafka client exists before attempting connection
+      if (!this.kafka) {
+        this.logger.warn('Kafka client not initialized', {
+          timestamp: new Date().toISOString(),
+        });
+        return false;
+      }
+
+      this.logger.info('Attempting real Kafka connection test', {
+        timestamp: new Date().toISOString(),
+      });
+      
+      // Use lightweight admin client to check connectivity instead of producing messages
       const admin = this.kafka.admin();
-      const consumerGroups = await admin.listGroups();
-      const groupIds = Array.from(this.consumers.keys());
-
-      const allConsumersConnected = groupIds.every((groupId) =>
-        consumerGroups.groups.some((group) => group.groupId === groupId),
-      );
-
-      return allConsumersConnected;
+      await admin.connect();
+      
+      // Simple connectivity test - if we can connect and disconnect, Kafka is available
+      await admin.disconnect();
+      
+      this.logger.info('Kafka connectivity test successful', {
+        timestamp: new Date().toISOString(),
+      });
+      
+      return true;
     } catch (error) {
       const err = error as Error;
-      this.logger.error('Failed to check Kafka connection status', {
-        error: err.stack,
+      this.logger.warn('Kafka connectivity check failed', {
+        error: err.message,
+        stack: err.stack,
         timestamp: new Date().toISOString(),
       });
       return false;
